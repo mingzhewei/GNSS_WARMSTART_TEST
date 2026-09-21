@@ -206,6 +206,9 @@ def cut_cycles(times, locked, min_outage=MIN_OUTAGE_S, merge_gap=MERGE_GAP_S):
         cycles.append(dict(outage_start=times[a], outage_end=times[b],
                            t_lock=times[nxt], outage_dur=round(dur, 2),
                            lock_idx=nxt))
+    # 事件窗口必须在下一周期断线开始前截止，避免把后续周期状态混入当前周期。
+    for i, c in enumerate(cycles):
+        c['next_outage_start'] = cycles[i + 1]['outage_start'] if i + 1 < len(cycles) else None
     return cycles
 
 # ----------------------------------------------------------------------
@@ -273,10 +276,13 @@ def pair_earliest(my_cycles, other_cycles, tol=PAIR_TOL_S):
 # ----------------------------------------------------------------------
 
 def analyze_cycle(cyc, t0, rows, after=180.0):
-    """t0 起 after 秒窗口内的关键时刻与卫星曲线。"""
-    win = [r for r in rows if t0 - 0.05 <= r['t'] <= t0 + after]
+    """当前周期内的关键时刻；截止于本设备下一次断线开始。"""
+    cycle_end = cyc.get('next_outage_start')
+    end = min(t0 + after, cycle_end) if cycle_end is not None else t0 + after
+    win = [r for r in rows if t0 - 0.05 <= r['t'] <= end]
+    valid = [r for r in win if r['sol'] == 'SOL_COMPUTED']
     def first(pred):
-        for r in win:
+        for r in valid:
             if pred(r):
                 return round(r['t'] - t0, 1)
         return None
@@ -290,21 +296,21 @@ def analyze_cycle(cyc, t0, rows, after=180.0):
     )
     # 首固定保持 5s
     fixed_hold = None
-    for i, r in enumerate(win):
+    for i, r in enumerate(valid):
         if cat_of(r['pt']) == 3:
-            hold = all(cat_of(x['pt']) == 3 for x in win[i:] if x['t'] <= r['t'] + 5.0)
+            hold = all(cat_of(x['pt']) == 3 for x in valid[i:] if x['t'] <= r['t'] + 5.0)
             if hold:
                 fixed_hold = round(r['t'] - t0, 1)
                 break
     def dur(a, b):
-        return None if (a is None or b is None) else round(b - a, 1)
+        return None if (a is None or b is None or b < a) else round(b - a, 1)
     stages = dict(lock_to_single=f['single'], single_to_float=dur(f['single'], f['float']),
                   float_to_fixed=dur(f['float'], f['fixed']), lock_to_fixed=f['fixed'])
     series = dict(t=[round(r['t'] - t0, 1) for r in win], svs=[r['svs'] for r in win],
                   soln=[r['soln'] for r in win], multi=[r['multi'] for r in win],
                   cats=[cat_of(r['pt']) for r in win])
     return dict(first=f, stages=stages, fixed_hold=fixed_hold, series=series,
-                n=len(win))
+                n=len(win), valid_n=len(valid), window_end=round(end - t0, 1))
 
 # ----------------------------------------------------------------------
 # 主流程
@@ -398,7 +404,7 @@ def make_images(data, out_dir):
 
     # 图1：各周期关键时刻
     fig, ax = plt.subplots(figsize=(max(11, len(cyc) * 0.9), 4.8))
-    marks = [('single', '首单点', '#3b82f6', 's'),
+    marks = [('single', '首单点/伪距类', '#3b82f6', 's'),
              ('float', '首浮点', '#f59e0b', '^'),
              ('fixed', '首固定', '#16a34a', 'D')]
     for key, lab, col, mk in marks:
@@ -456,8 +462,8 @@ def make_images(data, out_dir):
             if v is not None:
                 ax.axvline(v, color=col, ls='--', lw=0.9)
                 ax.text(v, ax.get_ylim()[1] * 0.92, lab, color=col, fontsize=7, rotation=90, va='top')
-        ax.set_title('周期 #%d（断线 %.0fs）' % (c['idx'], c['outage_dur']), fontsize=9)
-        ax.set_xlim(0, min(120, max(s['t']) if s['t'] else 60))
+        ax.set_title('周期 #%d（断线 %.0fs，窗口截止 %.1fs）' % (c['idx'], c['outage_dur'], c['window_end']), fontsize=9)
+        ax.set_xlim(0, max(1.0, max(s['t']) if s['t'] else 60))
         if i == 0:
             ax.legend(loc='lower right', fontsize=7.5)
         ax.grid(ls='--', alpha=0.3)
@@ -519,7 +525,7 @@ HTML = """<!DOCTYPE html>
 
 <h2>二、各热启动周期关键时刻（自起点秒）</h2>
 <div class="card"><table>
-<tr><th>周期</th><th>断线时长</th><th>本机起点</th><th>对端起点</th><th>取早t0</th><th>首单点</th><th>首浮点</th><th>首固定</th><th>固定保持5s</th><th>差分可用</th><th>星数≥10</th><th>星数≥20</th></tr>
+<tr><th>周期</th><th>断线时长</th><th>本机起点</th><th>对端起点</th><th>取早t0</th><th>首单点/伪距类</th><th>首浮点</th><th>首固定</th><th>固定保持5s</th><th>差分可用</th><th>星数≥10</th><th>星数≥20</th></tr>
 __CYCTABLE__
 </table></div>
 <div class="imgcard"><img src="__IMG1__"></div>
@@ -531,7 +537,7 @@ __CYCTABLE__
 <div class="card"><table>
 <tr><th>指标</th><th>min / 均值 / max (n)</th></tr>
 <tr><td>断线时长(s)</td><td>__AGG_OUT__</td></tr>
-<tr><td>起点→首单点(s)</td><td>__AGG_S__</td></tr>
+<tr><td>起点→首单点/伪距类(s)</td><td>__AGG_S__</td></tr>
 <tr><td>起点→首浮点(s)</td><td>__AGG_F__</td></tr>
 <tr><td>起点→首固定(s)</td><td>__AGG_X__</td></tr>
 <tr><td>起点→固定保持5s(s)</td><td>__AGG_H__</td></tr>
@@ -594,7 +600,7 @@ def build_outputs(data, imgs):
         data['lock_src'], data['lock_rate'], data['n_cycles'], data['span']))
     md.append('')
     md.append('## 二、各周期关键时刻（自起点秒）')
-    md.append('| 周期 | 断线时长 | 首单点 | 首浮点 | 首固定 | 固定保持5s |')
+    md.append('| 周期 | 断线时长 | 首单点/伪距类 | 首浮点 | 首固定 | 固定保持5s |')
     md.append('|---|---|---|---|---|---|')
     for c in data['cycles']:
         f = c['first']

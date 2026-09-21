@@ -39,13 +39,22 @@ def cat_of(parser, pt):
     return 3 if pt in parser.CAT3 else 2 if pt in parser.CAT2 else 1 if pt in parser.CAT1 else 0
 
 
-def analyze_cycle(parser, t0, rows, after=WINDOW_AFTER):
-    win = [r for r in rows if t0 - 0.05 <= r['t'] <= t0 + after]
+def analyze_cycle(parser, t0, rows, cycle_end=None, after=WINDOW_AFTER):
+    """分析单个热启动周期的事件窗口。
+
+    cycle_end 必须是本设备下一周期断线开始时刻；没有下一周期时用 t0+after。
+    只统计 SOL_COMPUTED 的有效解，避免把异常解算状态中的 Position Type 当作有效定位。
+    """
+    end = min(t0 + after, cycle_end) if cycle_end is not None else t0 + after
+    win = [r for r in rows if t0 - 0.05 <= r['t'] <= end]
+    valid = [r for r in win if r['sol'] == 'SOL_COMPUTED']
+
     def first(pred):
-        for r in win:
+        for r in valid:
             if pred(r):
                 return round(r['t'] - t0, 1)
         return None
+
     f = dict(single=first(lambda r: cat_of(parser, r['pt']) == 1),
              float=first(lambda r: cat_of(parser, r['pt']) == 2),
              fixed=first(lambda r: cat_of(parser, r['pt']) == 3),
@@ -53,19 +62,28 @@ def analyze_cycle(parser, t0, rows, after=WINDOW_AFTER):
              svs10=first(lambda r: r['svs'] >= 10),
              svs20=first(lambda r: r['svs'] >= 20))
     fixed_hold = None
-    for i, r in enumerate(win):
+    for i, r in enumerate(valid):
         if cat_of(parser, r['pt']) == 3:
-            if all(cat_of(parser, x['pt']) == 3 for x in win[i:] if x['t'] <= r['t'] + 5.0):
+            if all(cat_of(parser, x['pt']) == 3 for x in valid[i:] if x['t'] <= r['t'] + 5.0):
                 fixed_hold = round(r['t'] - t0, 1)
                 break
-    def dur(a, b):
-        return None if (a is None or b is None) else round(b - a, 1)
-    stages = dict(lock_to_single=f['single'], single_to_float=dur(f['single'], f['float']),
-                  float_to_fixed=dur(f['float'], f['fixed']), lock_to_fixed=f['fixed'])
-    series = dict(t=[round(r['t'] - t0, 1) for r in win], svs=[r['svs'] for r in win],
-                  soln=[r['soln'] for r in win], multi=[r['multi'] for r in win],
+
+    def ordered_dur(a, b):
+        if a is None or b is None or b < a:
+            return None
+        return round(b - a, 1)
+
+    stages = dict(lock_to_single=f['single'],
+                  single_to_float=ordered_dur(f['single'], f['float']),
+                  float_to_fixed=ordered_dur(f['float'], f['fixed']),
+                  lock_to_fixed=f['fixed'])
+    series = dict(t=[round(r['t'] - t0, 1) for r in win],
+                  svs=[r['svs'] for r in win],
+                  soln=[r['soln'] for r in win],
+                  multi=[r['multi'] for r in win],
                   cats=[cat_of(parser, r['pt']) for r in win])
-    return dict(first=f, stages=stages, fixed_hold=fixed_hold, series=series, n=len(win))
+    return dict(first=f, stages=stages, fixed_hold=fixed_hold, series=series, n=len(win),
+                valid_n=len(valid), window_end=round(end - t0, 1))
 
 
 def build_group(devices):
@@ -95,9 +113,11 @@ def build_group(devices):
         t0 = min(c['t_lock'] for _, c in members)
         per_dev = []
         for d, c in members:
-            info = analyze_cycle(d['parser'], t0, d['pos_rows'])
+            info = analyze_cycle(d['parser'], t0, d['pos_rows'],
+                                 cycle_end=c.get('next_outage_start'))
             per_dev.append(dict(product=d['product'], display=d['display'], file=d['file'],
                                 lock_src=d['lock_src'], lock_rate=d['lock_rate'],
+                                pos_src=d.get('pos_src') or d['parser'].main_msg(),
                                 t_lock=round(c['t_lock'] - t0, 2), outage_dur=c['outage_dur'],
                                 **info))
         out_cycles.append(dict(idx=gi + SKIP_FIRST + 1, t0=t0, outage_dur=members[0][1]['outage_dur'],
@@ -107,6 +127,7 @@ def build_group(devices):
                               lock_src=d['lock_src'], lock_rate=d['lock_rate'],
                               n_cycles=len(d['cycles_used']), crc_bad=d['crc_bad'],
                               span=d['span'], main_msg=d['parser'].main_msg(),
+                              pos_src=d.get('pos_src', ''),
                               pos_integrity=d['pos_integrity'], lock_integrity=d['lock_integrity'],
                               lock_clause=d['parser'].lock_clause(), pt_clause=d['parser'].pt_clause(),
                               sv_clause=d['parser'].sv_clause(), stn_clause=d['parser'].stn_clause())
@@ -184,7 +205,7 @@ def make_images(data, out_dir):
                 ax.text(x, y, '%.1f' % y, ha='center', va='bottom', fontsize=7, color=DEV_COLORS[pi % len(DEV_COLORS)])
     ax.set_xticks(xs); ax.set_xticklabels(labs, fontsize=9)
     ax.set_xlabel('热启动周期'); ax.set_ylabel('自统一t0到首固定（秒）')
-    ax.set_title('各设备 各热启动周期 首固定耗时（t0=多设备最早locktime）', fontsize=13)
+    ax.set_title('各设备 各热启动周期 首固定耗时（周期截止至下一次断线）', fontsize=13)
     ax.grid(axis='y', ls='--', alpha=0.4); ax.legend(loc='upper left', fontsize=9)
     fig.tight_layout()
     paths['fixed'] = os.path.join(out_dir, 'img_首固定对比.png')
@@ -192,7 +213,7 @@ def make_images(data, out_dir):
 
     # 图2：各周期 单点/浮点/固定（分设备）
     fig, axes = plt.subplots(len(products), 1, figsize=(max(11, len(cyc) * 1.0), 3.2 * len(products)), squeeze=False)
-    marks = [('single', '首单点', 's'), ('float', '首浮点', '^'), ('fixed', '首固定', 'D')]
+    marks = [('single', '首单点/伪距类', 's'), ('float', '首浮点', '^'), ('fixed', '首固定', 'D')]
     for pi, prod in enumerate(products):
         ax = axes[pi][0]
         for key, lab, mk in marks:
@@ -203,7 +224,9 @@ def make_images(data, out_dir):
             ax.scatter(xs, ys, marker=mk, s=60, label=lab, zorder=3,
                        color={'single': '#3b82f6', 'float': '#f59e0b', 'fixed': '#16a34a'}[key])
         ax.set_xticks(xs); ax.set_xticklabels(labs, fontsize=8)
-        ax.set_ylabel('耗时(s)'); ax.set_title('%s 关键时刻' % prod, fontsize=11)
+        ax.set_ylabel('耗时(s)'); ax.set_title('%s 关键时刻（定位源：%s）' % (
+            prod, next((dv['pos_src'] for c in cyc for dv in c['devs']
+                        if dv['product'] == prod and dv.get('pos_src')), '未知')), fontsize=11)
         ax.grid(axis='y', ls='--', alpha=0.4); ax.legend(loc='upper left', ncols=3, fontsize=8)
     axes[-1][0].set_xlabel('热启动周期')
     fig.tight_layout()
@@ -219,12 +242,16 @@ def make_images(data, out_dir):
             s = dv['series']
             ax.plot(s['t'], s['svs'], lw=1.1, color=DEV_COLORS[pi % len(DEV_COLORS)],
                     label='%s #SVs' % dv['product'], drawstyle='steps-post')
-        ax.set_title('周期 #%d（断线 %.0fs，t0=多设备最早locktime）' % (c['idx'], c['outage_dur']), fontsize=9)
-        ax.set_xlim(0, 90)
+        max_t = max((dv['window_end'] for dv in c['devs']), default=0.0)
+        ax.set_title('周期 #%d（断线 %.0fs，t0=多设备最早locktime，窗口截止 %.1fs）' % (
+            c['idx'], c['outage_dur'], max_t), fontsize=9)
+        ax.set_xlim(0, max(1.0, max_t))
         ax.grid(ls='--', alpha=0.3); ax.tick_params(labelsize=7.5)
         if i == 0:
-            ax.legend(loc='lower right', fontsize=7.5)
-    fig.suptitle('各周期 各设备 卫星数量恢复曲线', fontsize=12)
+            handles, labels = ax.get_legend_handles_labels()
+            sources = ['%s #SVs（%s）' % (dv['product'], dv.get('pos_src', '未知')) for dv in c['devs']]
+            ax.legend(handles, sources, loc='lower right', fontsize=7.5)
+    fig.suptitle('各周期 各设备 卫星数量恢复曲线（只画当前周期，不含下一次断线后数据）', fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.99])
     paths['svs'] = os.path.join(out_dir, 'img_卫星数量时间轴.png')
     fig.savefig(paths['svs'], dpi=150); plt.close(fig)
@@ -279,6 +306,7 @@ __DEVTABLE__
 
 <h2>二、各热启动周期 各设备关键时刻（自统一t0秒）</h2>
 __CYC_BLOCKS__
+<div class="note">关键时刻只统计 <b>SOL_COMPUTED</b> 的 Position Type；每个周期只统计到本设备下一次断线开始前，不把后续周期混入当前周期。“首单点/伪距类”包含 SINGLE/SPPDIFF/PSRDIFF 等伪距类定位；无浮点解的周期显示为“—”，不用下一周期补值。</div>
 <div class="imgcard"><img src="__IMG_FIXED__"></div>
 <div class="imgcard"><img src="__IMG_KEY__"></div>
 
@@ -290,7 +318,7 @@ __AGG_BLOCKS__
 
 <h2>附录：口径与手册条款对应</h2>
 <div class="card"><table>
-<tr><th>设备</th><th>起点(locktime)</th><th>定位类型</th><th>卫星计数</th><th>差分(基站ID)</th></tr>
+<tr><th>设备</th><th>起点(locktime)</th><th>定位类型</th><th>卫星计数</th><th>差分(基站ID)</th><th>定位源</th></tr>
 __CLAUSE_TABLE__
 </table></div>
 </div></body></html>
@@ -313,15 +341,16 @@ def build_outputs(data, imgs):
     cyc_blocks = []
     for c in data['cycles']:
         rows = ''.join(
-            "<tr><td>%s</td><td class='mono'>%s</td><td>%.1f</td><td>%.2f</td><td>%s</td><td>%s</td><td class='ok'>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            "<tr><td>%s</td><td class='mono'>%s</td><td>%.1f</td><td>%.2f</td><td>%s</td><td>%s</td><td>%s</td><td class='ok'>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
                 dv['display'], dv['file'], dv['outage_dur'], dv['t_lock'],
                 V(dv['first']['single']), V(dv['first']['float']), V(dv['first']['fixed']),
-                V(dv['fixed_hold']), V(dv['first']['svs10']), V(dv['first']['svs20']))
+                V(dv['fixed_hold']), V(dv['first']['svs10']), V(dv['first']['svs20']),
+                V(dv['window_end']))
             for dv in c['devs'])
         cyc_blocks.append(
-            "<h3 style='font-size:14px;margin:14px 0 6px'>周期 #%d（断线 %.0fs，统一t0）</h3>"
+            "<h3 style='font-size:14px;margin:14px 0 6px'>周期 #%d（断线 %.0fs，统一t0，窗口截止于下一次断线）</h3>"
             "<div class='card'><table><tr><th>设备</th><th>文件</th><th>断线时长</th><th>本机locktime(相对t0)</th>"
-            "<th>首单点</th><th>首浮点</th><th>首固定</th><th>固定保持5s</th><th>星≥10</th><th>星≥20</th></tr>%s</table></div>"
+            "<th>首单点/伪距类</th><th>首浮点</th><th>首固定</th><th>固定保持5s</th><th>星≥10</th><th>星≥20</th><th>窗口截止</th></tr>%s</table></div>"
             % (c['idx'], c['outage_dur'], rows))
 
     agg_blocks = []
@@ -331,15 +360,16 @@ def build_outputs(data, imgs):
         agg_blocks.append(
             "<h3 style='font-size:14px;margin:14px 0 6px'>%s</h3><div class='card'><table>"
             "<tr><th>指标</th><th>min/均值/max(n)</th></tr>"
-            "<tr><td>起点→首单点</td><td>%s</td></tr><tr><td>起点→首浮点</td><td>%s</td></tr>"
+            "<tr><td>起点→首单点/伪距类</td><td>%s</td></tr><tr><td>起点→首浮点</td><td>%s</td></tr>"
             "<tr><td>起点→首固定</td><td>%s</td></tr><tr><td>起点→固定保持5s</td><td>%s</td></tr>"
             "<tr><td>单点→浮点</td><td>%s</td></tr><tr><td>浮点→固定</td><td>%s</td></tr></table></div>" % (
                 disp, S(a['single']), S(a['float']), S(a['fixed']), S(a['fixed_hold']),
                 S(a['single_to_float']), S(a['float_to_fixed'])))
 
     clause_table = ''.join(
-        "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-            d['display'], d['lock_clause'], d['pt_clause'], d['sv_clause'], d['stn_clause'])
+        "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class='mono'>%s</td></tr>" % (
+            d['display'], d['lock_clause'], d['pt_clause'], d['sv_clause'], d['stn_clause'],
+            d.get('pos_src') or d['main_msg'])
         for d in data['devices'])
 
     html = (HTML.replace('__TAG__', TAG).replace('__CSS__', CSS)
@@ -358,7 +388,7 @@ def build_outputs(data, imgs):
         a = agg_dev(data['cycles'], prod)
         disp = next(d['display'] for d in data['devices'] if d['product'] == prod)
         md.append('## %s' % disp)
-        for k, lab in [('single', '起点→单点'), ('float', '起点→浮点'), ('fixed', '起点→固定'), ('fixed_hold', '起点→固定保持5s')]:
+        for k, lab in [('single', '起点→单点/伪距类'), ('float', '起点→浮点'), ('fixed', '起点→固定'), ('fixed_hold', '起点→固定保持5s')]:
             md.append('- %s：%s' % (lab, S(a[k])))
         md.append('')
     return html, '\n'.join(md)

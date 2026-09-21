@@ -17,10 +17,10 @@
 口径依据（华测《M7系列模组用户指令及协议手册 V2.7》）：
   * 起点事件    RANGEA 任一通道 locktime 0→>0（3.2.25 字段14 locktime=连续跟踪时间无周跳；
                 字段布局同 BASEOBS 表3-24：psr/psr_std/adr/adr_std/dopp/C-No/locktime/ch-tr-status）
-  * 定位主报文  RTKPA（3.2.42 表3-96）：定位类型表3-40、卫星 #SVs/#solnSVs/#solnMultiSVs(字段15/16/17)、StnID(字段24)
+  * 定位主报文  BESTPA（M7 V2.7 3.3.3 BESTP_1 表3-107）：定位类型表3-109、卫星 #SVs/#solnSVs/#solnMultiSVs(字段15/16/17)、StnID(字段24)
   * 卫星数补充  ENVSTATUSA（3.2.19 表3-51 字段9 #SVs）
-  * 差分可用    RTKPA Stn ID 非空且 != "0"
-  * 定位类型    表3-40：NONE=0/SINGLE=1/NARROW_INT=4/NARROW_FLOAT=5；PSRDIFF 实测为伪距差分(归单点类)
+  * 差分可用    BESTPA Stn ID 非空且 != "0"
+  * 定位类型    表3-109：NONE=0/SINGLE=1/SPPDIFF=2/NARROW_INT=4/NARROW_FLOAT=5；PSRDIFF 实测为伪距差分(归单点类)
   * CRC         "#"=32位CRC，"$"=NMEA异或
 
 输出：report.html / report.md / img_*.png / summary.json
@@ -220,14 +220,18 @@ def cut_cycles(times, locked, min_outage=MIN_OUTAGE_S, merge_gap=MERGE_GAP_S):
             continue
         cycles.append(dict(outage_start=times[a], outage_end=times[b], t_lock=times[nxt],
                            outage_dur=round(dur, 2), lock_idx=nxt))
+    # 事件窗口必须在下一周期断线开始前截止，避免把后续周期状态混入当前周期。
+    for i, c in enumerate(cycles):
+        c['next_outage_start'] = cycles[i + 1]['outage_start'] if i + 1 < len(cycles) else None
     return cycles
 
 # ----------------------------------------------------------------------
-# 主定位序列（RTKPA，GMF 10Hz）
+# 主定位序列（优先 BESTPA；旧数据回退 RTKPA）
 # ----------------------------------------------------------------------
 
 def build_pos_series(path):
-    rows = []
+    """优先解析连续 BESTPA；旧数据无 BESTPA 时回退 RTKPA。"""
+    candidates = collections.defaultdict(list)
     counts = collections.Counter()
     other = collections.Counter()
     bad = 0
@@ -239,20 +243,20 @@ def build_pos_series(path):
             counts[name] += 1
         else:
             other[name] += 1
-        if name != 'RTKPA' or hf is None:
+        if name not in ('BESTPA', 'RTKPA') or hf is None:
             continue
         t = htime(hf, name)
-        if t is None or len(bf) < 18:
+        if t is None or len(bf) < 23:
             continue
         try:
-            rows.append(dict(t=t, ts=hf[5], sol=bf[0], pt=bf[1],
-                             stn=bf[22].strip('"') if len(bf) > 22 else '',
-                             age=float(bf[12]),
-                             svs=int(bf[14]), soln=int(bf[15]), multi=int(bf[16])))
-        except Exception:
+            candidates[name].append(dict(t=t, ts=hf[5], sol=bf[0], pt=bf[1],
+                                         stn=bf[22].strip('"'), age=float(bf[11]),
+                                         svs=int(bf[13]), soln=int(bf[14]), multi=int(bf[15])))
+        except (ValueError, IndexError):
             continue
-    return rows, counts, other, bad
-
+    src = 'BESTPA' if candidates.get('BESTPA') else ('RTKPA' if candidates.get('RTKPA') else '')
+    rows = candidates.get(src, [])
+    return rows, counts, other, bad, src
 
 def cat_of(pt):
     return 3 if pt in CAT3 else 2 if pt in CAT2 else 1 if pt in CAT1 else 0
@@ -279,9 +283,13 @@ def pair_earliest(my_cycles, other_cycles, tol=PAIR_TOL_S):
 
 
 def analyze_cycle(cyc, t0, rows, after=180.0):
-    win = [r for r in rows if t0 - 0.05 <= r['t'] <= t0 + after]
+    """当前周期内的关键时刻；截止于本设备下一次断线开始。"""
+    cycle_end = cyc.get('next_outage_start')
+    end = min(t0 + after, cycle_end) if cycle_end is not None else t0 + after
+    win = [r for r in rows if t0 - 0.05 <= r['t'] <= end]
+    valid = [r for r in win if r['sol'] == 'SOL_COMPUTED']
     def first(pred):
-        for r in win:
+        for r in valid:
             if pred(r):
                 return round(r['t'] - t0, 1)
         return None
@@ -292,19 +300,19 @@ def analyze_cycle(cyc, t0, rows, after=180.0):
              svs10=first(lambda r: r['svs'] >= 10),
              svs20=first(lambda r: r['svs'] >= 20))
     fixed_hold = None
-    for i, r in enumerate(win):
+    for i, r in enumerate(valid):
         if cat_of(r['pt']) == 3:
-            if all(cat_of(x['pt']) == 3 for x in win[i:] if x['t'] <= r['t'] + 5.0):
+            if all(cat_of(x['pt']) == 3 for x in valid[i:] if x['t'] <= r['t'] + 5.0):
                 fixed_hold = round(r['t'] - t0, 1)
                 break
     def dur(a, b):
-        return None if (a is None or b is None) else round(b - a, 1)
+        return None if (a is None or b is None or b < a) else round(b - a, 1)
     stages = dict(lock_to_single=f['single'], single_to_float=dur(f['single'], f['float']),
                   float_to_fixed=dur(f['float'], f['fixed']), lock_to_fixed=f['fixed'])
     series = dict(t=[round(r['t'] - t0, 1) for r in win], svs=[r['svs'] for r in win],
                   soln=[r['soln'] for r in win], multi=[r['multi'] for r in win],
                   cats=[cat_of(r['pt']) for r in win])
-    return dict(first=f, stages=stages, fixed_hold=fixed_hold, series=series, n=len(win))
+    return dict(first=f, stages=stages, fixed_hold=fixed_hold, series=series, n=len(win), valid_n=len(valid), window_end=round(end - t0, 1))
 
 
 def build(hc_path, by_path=None):
@@ -326,7 +334,7 @@ def build(hc_path, by_path=None):
             other_src = osrc
         except Exception as e:
             print('北云配对失败（改用本机起点）:', e)
-    rows, counts, other, bad = build_pos_series(hc_path)
+    rows, counts, other, bad, pos_src = build_pos_series(hc_path)
     cycles = []
     for ci, c in enumerate(my_cycles):
         t0 = pair.get(ci, {}).get('t0', c['t_lock'])
@@ -337,7 +345,7 @@ def build(hc_path, by_path=None):
                                          else round(pair[ci]['other_t_lock'] - lt_t[0], 1)),
                            t0=t0, t0_abs=t0, paired=pair.get(ci, {}).get('paired', False), **info))
     return dict(file=name, product=PRODUCT, lock_src=lt_src, lock_rate=round(1.0 / lt_period, 1),
-                other_lock_src=other_src, n_cycles=len(cycles), cycles=cycles,
+                other_lock_src=other_src, pos_src=pos_src, n_cycles=len(cycles), cycles=cycles,
                 counts=dict(counts), other=dict(other), crc_bad=bad,
                 span=round(rows[-1]['t'] - rows[0]['t'], 1) if rows else 0)
 
@@ -387,7 +395,7 @@ def make_images(data, out_dir):
 
     # 图1：各周期关键时刻
     fig, ax = plt.subplots(figsize=(max(11, len(cyc) * 0.9), 4.8))
-    marks = [('single', '首单点', '#3b82f6', 's'),
+    marks = [('single', '首单点/伪距类', '#3b82f6', 's'),
              ('float', '首浮点', '#f59e0b', '^'),
              ('fixed', '首固定', '#16a34a', 'D')]
     for key, lab, col, mk in marks:
@@ -445,8 +453,8 @@ def make_images(data, out_dir):
             if v is not None:
                 ax.axvline(v, color=col, ls='--', lw=0.9)
                 ax.text(v, ax.get_ylim()[1] * 0.92, lab, color=col, fontsize=7, rotation=90, va='top')
-        ax.set_title('周期 #%d（断线 %.0fs）' % (c['idx'], c['outage_dur']), fontsize=9)
-        ax.set_xlim(0, min(120, max(s['t']) if s['t'] else 60))
+        ax.set_title('周期 #%d（断线 %.0fs，窗口截止 %.1fs）' % (c['idx'], c['outage_dur'], c['window_end']), fontsize=9)
+        ax.set_xlim(0, max(1.0, max(s['t']) if s['t'] else 60))
         if i == 0:
             ax.legend(loc='lower right', fontsize=7.5)
         ax.grid(ls='--', alpha=0.3)
@@ -508,7 +516,7 @@ HTML = """<!DOCTYPE html>
 
 <h2>二、各热启动周期关键时刻（自起点秒）</h2>
 <div class="card"><table>
-<tr><th>周期</th><th>断线时长</th><th>本机起点</th><th>对端起点</th><th>取早t0</th><th>首单点</th><th>首浮点</th><th>首固定</th><th>固定保持5s</th><th>差分可用</th><th>星数≥10</th><th>星数≥20</th></tr>
+<tr><th>周期</th><th>断线时长</th><th>本机起点</th><th>对端起点</th><th>取早t0</th><th>首单点/伪距类</th><th>首浮点</th><th>首固定</th><th>固定保持5s</th><th>差分可用</th><th>星数≥10</th><th>星数≥20</th></tr>
 __CYCTABLE__
 </table></div>
 <div class="imgcard"><img src="__IMG1__"></div>
@@ -520,7 +528,7 @@ __CYCTABLE__
 <div class="card"><table>
 <tr><th>指标</th><th>min / 均值 / max (n)</th></tr>
 <tr><td>断线时长(s)</td><td>__AGG_OUT__</td></tr>
-<tr><td>起点→首单点(s)</td><td>__AGG_S__</td></tr>
+<tr><td>起点→首单点/伪距类(s)</td><td>__AGG_S__</td></tr>
 <tr><td>起点→首浮点(s)</td><td>__AGG_F__</td></tr>
 <tr><td>起点→首固定(s)</td><td>__AGG_X__</td></tr>
 <tr><td>起点→固定保持5s(s)</td><td>__AGG_H__</td></tr>
@@ -583,7 +591,7 @@ def build_outputs(data, imgs):
         data['lock_src'], data['lock_rate'], data['n_cycles'], data['span']))
     md.append('')
     md.append('## 二、各周期关键时刻（自起点秒）')
-    md.append('| 周期 | 断线时长 | 首单点 | 首浮点 | 首固定 | 固定保持5s |')
+    md.append('| 周期 | 断线时长 | 首单点/伪距类 | 首浮点 | 首固定 | 固定保持5s |')
     md.append('|---|---|---|---|---|---|')
     for c in data['cycles']:
         f = c['first']
@@ -599,23 +607,24 @@ def build_outputs(data, imgs):
 
 
 def main_msg_name():
-    return 'RTKPA（定位）+ ENVSTATUSA（卫星）'
+    return 'BESTPA（定位状态）+ RANGEA（locktime）'
 
 
 def lock_clause():
-    return 'M7 3.2.25 GNSSOBS/RANGE 字段14(locktime)（布局同表3-24 BASEOBS）'
+    return ('RANGEA 本文件观测记录含 locktime；其“连续跟踪、无周跳”语义按 M7 V2.7 '
+            'GNSSOBS/BASEOBS locktime 字段核对')
 
 
 def pt_clause():
-    return 'M7 表3-40（SINGLE=1/NARROW_INT=4/NARROW_FLOAT=5）'
+    return 'M7 V2.7 3.3.3 BESTP_1 表3-107；Position Type 表3-109'
 
 
 def sv_clause():
-    return 'M7 3.2.42 表3-96 RTKP 字段15/16/17'
+    return 'M7 V2.7 3.3.3 BESTP_1 表3-107 字段15/16/17'
 
 
 def stn_clause():
-    return 'M7 3.2.42 表3-96 RTKP 字段24'
+    return 'M7 V2.7 3.3.3 BESTP_1 表3-107 字段24'
 
 
 def run(paths, out_dir=None, open_browser=False):

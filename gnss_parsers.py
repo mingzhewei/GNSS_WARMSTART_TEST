@@ -131,6 +131,9 @@ def cut_cycles(times, locked, min_outage=MIN_OUTAGE_S, merge_gap=MERGE_GAP_S):
             continue
         cycles.append(dict(outage_start=times[a], outage_end=times[b], t_lock=times[nxt],
                            outage_dur=round(dur, 2), lock_idx=nxt))
+    # 事件窗口必须在下一周期断线开始前截止，避免把后续周期状态混入当前周期。
+    for i, c in enumerate(cycles):
+        c['next_outage_start'] = cycles[i + 1]['outage_start'] if i + 1 < len(cycles) else None
     return cycles
 
 
@@ -274,6 +277,7 @@ class BeiyunParser(ParserBase):
         return dict(product=self.key, display=self.display, file=os.path.basename(path),
                     lock_times=times, lock_counts=locked, lock_src=src,
                     lock_rate=round(1.0 / period, 1), cycles=cycles, pos_rows=pos_rows,
+                    pos_src='BESTGNSSPOSA',
                     counts=dict(counts), other=dict(other), crc_bad=bad,
                     pos_integrity=pos_integrity, lock_integrity=lock_integrity,
                     span=round(pos_rows[-1]['t'] - pos_rows[0]['t'], 1) if pos_rows else 0,
@@ -297,10 +301,10 @@ class BeiyunParser(ParserBase):
 
 @register
 class HuaceParser(ParserBase):
-    """华测 M720。锁定源 RANGEA(3.2.25 字段14 locktime，1Hz)；定位 RTKPA(3.2.42，10Hz)。
+    """华测 M720。锁定源 RANGEA(3.2.25 字段14 locktime，1Hz)；定位主报文优先使用连续 BESTPA。
     双报文格式：GMF(week=字段6,TOW=字段7 ms) / NovAtel(week=字段5,sec=字段6 s)。"""
     key = 'huace'
-    display = '华测 HUACE（M720，RTKPA+RANGEA）'
+    display = '华测 HUACE（M720，BESTPA+RANGEA）'
     CAT1 = {'SINGLE', 'PSRDIFF', 'SPPDIFF', 'WAAS', 'SBAS', 'INS_PSRSP', 'INS_PSRDIFF', 'INS_SBAS', 'INS_SPP'}
     CAT2 = {'L1_FLOAT', 'IONOFREE_FLOAT', 'NARROW_FLOAT', 'FLOATCONV', 'WIDELANE', 'NARROWLANE',
             'INS_RTKFLOAT', 'PPP_CONVERGING'}
@@ -367,9 +371,18 @@ class HuaceParser(ParserBase):
                 locked += 1
         return locked
 
+    @staticmethod
+    def _pos_row(t, hf, bf):
+        """GMF BESTPA/RTKPA 的公共 body 字段映射（0 基）。"""
+        if len(bf) < 23:
+            raise ValueError('short position body')
+        return dict(t=t, ts=hf[5], sol=bf[0], pt=bf[1],
+                    stn=bf[22].strip('"'), age=float(bf[11]),
+                    svs=int(bf[13]), soln=int(bf[14]), multi=int(bf[15]))
+
     def parse(self, path):
         lock_cands = collections.defaultdict(list)
-        pos_rows = []
+        pos_candidates = collections.defaultdict(list)
         counts = collections.Counter()
         other = collections.Counter()
         bad = 0
@@ -392,17 +405,22 @@ class HuaceParser(ParserBase):
                 t = self._htime(hf, name)
                 if t is not None:
                     lock_cands[name].append((t, self._gnssobs_locked(bf)))
-            elif name == 'RTKPA':
+            elif name in ('BESTPA', 'RTKPA'):
                 t = self._htime(hf, name)
-                if t is None or len(bf) < 18:
+                if t is None:
                     continue
                 try:
-                    pos_rows.append(dict(t=t, ts=hf[5], sol=bf[0], pt=bf[1],
-                                         stn=bf[22].strip('"') if len(bf) > 22 else '',
-                                         age=float(bf[12]),
-                                         svs=int(bf[14]), soln=int(bf[15]), multi=int(bf[16])))
-                except Exception:
+                    pos_candidates[name].append(self._pos_row(t, hf, bf))
+                except (ValueError, IndexError):
                     continue
+        # BESTPA 是本批数据中的连续定位状态流；RTKPA 存在长间断，不能可靠判断首次事件。
+        # 旧数据未录制 BESTPA 时保留 RTKPA 兜底，完整性表会暴露其采样问题。
+        if pos_candidates.get('BESTPA'):
+            pos_src, pos_rows = 'BESTPA', pos_candidates['BESTPA']
+        elif pos_candidates.get('RTKPA'):
+            pos_src, pos_rows = 'RTKPA', pos_candidates['RTKPA']
+        else:
+            pos_src, pos_rows = '', []
         src, times, locked, period = pick_highest_freq(lock_cands)
         cycles = cut_cycles(times, locked)
         pos_integrity = frame_integrity([r['t'] for r in pos_rows])
@@ -410,21 +428,23 @@ class HuaceParser(ParserBase):
         return dict(product=self.key, display=self.display, file=os.path.basename(path),
                     lock_times=times, lock_counts=locked, lock_src=src,
                     lock_rate=round(1.0 / period, 1), cycles=cycles, pos_rows=pos_rows,
+                    pos_src=pos_src,
                     counts=dict(counts), other=dict(other), crc_bad=bad,
                     pos_integrity=pos_integrity, lock_integrity=lock_integrity,
                     span=round(pos_rows[-1]['t'] - pos_rows[0]['t'], 1) if pos_rows else 0,
                     parser=self)
 
     def lock_clause(self):
-        return 'M7 3.2.25 GNSSOBS/RANGE 字段14(locktime)（布局同表3-24 BASEOBS）'
+        return ('RANGEA 本文件观测记录含 locktime；其“连续跟踪、无周跳”语义按 M7 V2.7 '
+                'GNSSOBS/BASEOBS locktime 字段核对')
     def pt_clause(self):
-        return 'M7 表3-40（SINGLE=1/NARROW_INT=4/NARROW_FLOAT=5）'
+        return 'M7 V2.7 3.3.3 BESTP_1 表3-107；Position Type 表3-109'
     def sv_clause(self):
-        return 'M7 3.2.42 表3-96 RTKP 字段15/16/17'
+        return 'M7 V2.7 3.3.3 BESTP_1 表3-107 字段15/16/17'
     def stn_clause(self):
-        return 'M7 3.2.42 表3-96 RTKP 字段24'
+        return 'M7 V2.7 3.3.3 BESTP_1 表3-107 字段24'
     def main_msg(self):
-        return 'RTKPA（定位）+ ENVSTATUSA（卫星）'
+        return 'BESTPA（定位状态）+ RANGEA（locktime）'
 
 # ----------------------------------------------------------------------
 # 逐帧完整性检查（按报头时间戳自判，不假设频率）
