@@ -1,0 +1,127 @@
+
+
+===== PAGE 1 =====
+和芯星云 NebulasIV 系列产品
+尺寸	：17.0	×	22.0	×	2.6	mm
+UM980
+BDS/GPS/GLONASS/Galileo/QZSS
+全系统全频高精度 RTK	定位模块
+UM980 是和芯星通自主研发的新一代 BDS/GPS/GLONASS/Galileo/QZSS 全系统全频
+高精度 RTK 定位模块，基于和芯星通自主研发的新一代射频基带及高精度算法一体化
+GNSS	SoC 芯片—NebulasIV 设计。可同时跟踪 BDS、GPS、GLONASS、Galileo、
+QZSS、NavIC、SBAS 等全系统全频点。内嵌的多频点抗干扰技术，完成增强的多模
+多频 RTK 引擎解算，显著改善城市街区和树荫等复杂环境下的 RTK 初始化速度、测
+量精度和可靠性。面向精准农业、测量测绘等高精度导航定位领域。
+产品特点
+	
+»
+基于最新一代 NebulasIV 射频基带及高精度算法一体化 GNSS	SoC 芯片
+	
+»
+全系统全频 RTK 引擎及满天星 RTK 技术	
+	
+»
+瞬时 RTK 初始化技术						
+	
+»
+优秀的抗干扰能力和防欺骗能力，支持干扰检测和欺骗检测
+	
+»
+支持 Heading2 定向技术
+	
+»
+支持 STANDALONE 单站高精度定位
+	
+»
+支持 B2b-PPP、E6-HAS	和	QZSS	L6E（MADOCA）PPP 服务
+性能指标
+性能指标
+通道
+1408 通道，基于 NebulasIV
+时间精度	(RMS)
+20	ns
+信号
+	
+BDS	B1I,	B2I,	B3I,	B1C,	B2a,	B2b
+速度精度	(RMS)
+0.03	m/s
+GPS	L1C/A,	L1C,	L2C,	L2P(Y),	L5
+冷启动
+<	12	s
+GLONASS	G1,	G2,	G3
+初始化时间
+<	5	s	( 典型值 )
+Galileo	E1,	E5a,	E5b,	E6
+初始化可靠性
+>	
+99.9%
+QZSS	L1C/A,	L1C/B,	L1C,	L2C,	L5,	L6
+数据更新率
+50	Hz*
+NavIC	L5
+差分数据
+RTCM	V3.X
+SBAS	L1C/A
+数据格式
+NMEA	0183,	Unicore
+单点定位	(RMS)
+平面：1.5	m
+物理特性
+高程：2.5	m
+封装
+54	pin	LGA
+DGPS	(RMS)
+平面：0.4	m
+尺寸
+17.0	×	22.0	×	2.6	mm
+高程：0.8	m
+重量
+1.88	g		±	0.03	g
+RTK	(RMS)
+平面：0.8	cm	+	1	ppm
+环境指标
+高程：1.5	cm	+	1	ppm
+工作温度
+-40℃ ~	+85℃
+PPP	(RMS)
+平面：5	cm
+存储温度
+-55℃ ~	+95℃
+高程：10	cm
+湿度
+95%	非凝露
+观测精度（RMS）
+BDS										GPS									GLONASS							Galileo
+振动
+GB/T	28046.3,1SO	16750-3
+B1I/B1C/L1C/L1	C/A/G1/E1
+伪距
+10cm							10cm							10cm															10cm
+冲击
+GB/T	28046.3,1SO	16750-3
+B1I/B1C/L1C/L1	C/A/G1/E1
+载波相位
+1mm								1mm							1mm																1mm
+功能接口
+B2I/B2a/	B2b/L5/E5a/E5b
+伪距
+10cm							10cm							10cm															10cm
+3	×	UART	(LVTTL)	
+B2I/B2a/	B2b/L5/E5a/E5b
+载波相位
+1mm								1mm							1mm																1mm
+1×SPI*
+B3I/L2P(Y)/L2C/G2
+伪距
+10cm							10cm							10cm															10cm
+1	×	I
+2
+C*
+B3I/L2P(Y)/L2C/G2
+载波相位
+1mm								1mm							1mm																1mm
+1	×	CAN*	( 与 UART3 复用 )
+注：标注	*	部分为特定固件或硬件版本支持
+应用领域
+测量测绘
+精准农业
