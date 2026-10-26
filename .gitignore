@@ -4,7 +4,6 @@ __pycache__/
 .mypy_cache/
 
 # 本地环境与缓存
-.codebuddy/
 .vscode/
 .idea/
 
