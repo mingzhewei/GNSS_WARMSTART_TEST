@@ -25,6 +25,7 @@ import os
 import sys
 import io
 import collections
+import struct
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() not in ('utf-8', 'utf8'):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -50,7 +51,10 @@ def crc32b(data):
 
 def iter_msgs(path):
     """逐条产出 CRC 校验通过的报文 (报文名, 报头字段list, 数据字段list, kind)。
-    '#'开头=32位CRC，'$'开头=NMEA异或；kind in ('hash','nmea')；结尾产出 ('__BAD__',bad数,...)。"""
+
+    '#' 开头按 32 位 CRC，'$' 开头按 NMEA 异或。二进制/残缺前缀不是本函数的
+    输入对象；结尾产出 ('__BAD__', bad数, None, None)。
+    """
     raw = open(path, 'rb').read()
     bad = 0
     for line in raw.split(b'\n'):
@@ -64,12 +68,14 @@ def iter_msgs(path):
         body = line[1:star]
         try:
             if line[0] == 0x23:
-                ok = crc32b(body) == int(line[star + 1:star + 9], 16)
+                ok = (star + 9 <= len(line) and
+                      crc32b(body) == int(line[star + 1:star + 9], 16))
             else:
                 c = 0
                 for bb in body:
                     c ^= bb
-                ok = c == int(line[star + 1:star + 3], 16)
+                ok = (star + 3 <= len(line) and
+                      c == int(line[star + 1:star + 3], 16))
         except ValueError:
             ok = False
         if not ok:
@@ -79,10 +85,11 @@ def iter_msgs(path):
         if ';' in txt:
             h, b = txt.split(';', 1)
             hf = h.split(',')
-            yield hf[0], hf, b.split(','), 'hash'
+            bf = b.split(',')
+            yield hf[0], hf, bf, 'hash'
         else:
             yield txt.split(',')[0], None, txt.split(','), 'nmea'
-    yield '__BAD__', None, bad, None
+    yield '__BAD__', bad, None, None
 
 
 def pick_highest_freq(cands):
@@ -177,6 +184,32 @@ def register(cls):
 
 
 
+
+def iter_unicore_binary(path, msg_id=12):
+    """按 N4 表7-49/7-50 解析二进制帧，并校验表7-48 的 32 位 CRC。
+
+    本函数用于含 Unicore 二进制流的日志。帧头 AA44B5。帧长为
+    24 字节 Header + MessageLength + 4 字节 CRC（小端）。
+    """
+    raw = open(path, 'rb').read()
+    start = 0
+    while True:
+        pos = raw.find(b'\xaa\x44\xb5', start)
+        if pos < 0:
+            break
+        start = pos + 1
+        if pos + 28 > len(raw):
+            continue
+        length = int.from_bytes(raw[pos + 6:pos + 8], 'little')
+        msg = int.from_bytes(raw[pos + 4:pos + 6], 'little')
+        end = pos + 24 + length
+        if msg != msg_id or end + 4 > len(raw) or length < 4:
+            continue
+        if crc32b(raw[pos:end]) != int.from_bytes(raw[end:end + 4], 'little'):
+            continue
+        week = int.from_bytes(raw[pos + 10:pos + 12], 'little')
+        ms = int.from_bytes(raw[pos + 12:pos + 16], 'little')
+        yield week * 604800.0 + ms / 1000.0, raw[pos + 24:end]
 
 def detect_parser(path):
     """按内容自动识别设备（用于 HMI 提示）。识别不了返回 None。"""
@@ -449,6 +482,156 @@ class HuaceParser(ParserBase):
 # ----------------------------------------------------------------------
 # 逐帧完整性检查（按报头时间戳自判，不假设频率）
 # ----------------------------------------------------------------------
+
+# ======================================================================
+# 北斗（Unicore UM980）
+# ======================================================================
+
+@register
+class BeidouParser(ParserBase):
+    """北斗 UM980（Unicore N4）。定位 BESTNAVA；锁定源 OBSVMB(Message ID=12)。
+
+OBSVMB 与 ASCII 报文混录在同一日志，必须按 AA44B5 二进制帧扫描并校验
+N4 32 位 CRC，再按 OBSVM 表7-137 的 40 字节记录解码。
+    """
+    key = 'beidou'
+    display = '北斗 BD（UM980，BESTNAVA+OBSVMB）'
+    # N4 表0-5：伪距类、RTK浮点、RTK固定；PPP 不作为固定解归类。
+    CAT1 = {'SINGLE', 'PSRDIFF', 'SBAS'}
+    CAT2 = {'L1_FLOAT', 'IONOFREE_FLOAT', 'NARROW_FLOAT', 'PPP_CONVERGING'}
+    CAT3 = {'L1_INT', 'WIDE_INT', 'NARROW_INT'}
+
+    @staticmethod
+    def _htime(hf):
+        try:
+            # N4 ASCII Header 表7-51：字段5=GPS周数，字段6=周内毫秒。
+            return int(hf[4]) * 604800.0 + int(hf[5]) / 1000.0
+        except Exception:
+            return None
+
+    def match_path(self, path):
+        n = 0
+        for name, hf, bf, kind in iter_msgs(path):
+            if name == '__BAD__':
+                continue
+            if name in ('BESTNAVA', 'SATSINFOA', 'BESTSATA', 'RTKSTATUSA'):
+                return True
+            n += 1
+            if n > 3000:
+                break
+        # iter_msgs 只覆盖 ASCII 行；关键锁定源是混录的 OBSVMB 二进制帧。
+        try:
+            for t, payload in iter_unicore_binary(path, msg_id=12):
+                return True
+        except OSError:
+            pass
+        return False
+
+    @staticmethod
+    def _obsvm_locked(payload):
+        """按 N4 OBSVM 表7-137 解码所有 40 字节频点观测记录。"""
+        try:
+            nobs = int.from_bytes(payload[0:4], 'little')
+        except Exception:
+            return 0
+        if len(payload) < 4 + nobs * 40:
+            return 0
+        locked = 0
+        for i in range(nobs):
+            off = 4 + i * 40
+            rec = payload[off:off + 40]
+            try:
+                # 字段10 C/N0 在记录偏移28（H+32），值*100，
+                # 字段12 locktime 在记录偏移32（H+36），单位s。
+                cno = int.from_bytes(rec[28:30], 'little') / 100.0
+                locktime = struct.unpack('<f', rec[32:36])[0]
+            except Exception:
+                continue
+            if locktime > 0.0 and cno > 0.0:
+                locked += 1
+        return locked
+
+    @staticmethod
+    def _pos_row(t, hf, bf):
+        if len(bf) < 15:
+            raise ValueError('short BESTNAV body')
+        return dict(t=t, ts=hf[3], sol=bf[0], pt=bf[1],
+                    stn=bf[10].strip('"'), age=float(bf[11]),
+                    svs=int(bf[13]), soln=int(bf[14]), multi=0)
+
+    def parse(self, path):
+        counts = collections.Counter()
+        other = collections.Counter()
+        bad = 0
+        pos_rows = []
+        for name, hf, bf, kind in iter_msgs(path):
+            if name == '__BAD__':
+                bad = hf if hf is not None else 0
+                continue
+            if kind == 'hash':
+                counts[name] += 1
+            else:
+                other[name] += 1
+            if name != 'BESTNAVA' or hf is None:
+                continue
+            t = self._htime(hf)
+            if t is None:
+                continue
+            try:
+                pos_rows.append(self._pos_row(t, hf, bf))
+            except (ValueError, IndexError):
+                continue
+
+        times, locked = [], []
+        binary_bad = 0
+        raw = open(path, 'rb').read()
+        start = 0
+        while True:
+            pos = raw.find(b'\xaa\x44\xb5', start)
+            if pos < 0:
+                break
+            start = pos + 1
+            if pos + 28 > len(raw):
+                continue
+            length = int.from_bytes(raw[pos + 6:pos + 8], 'little')
+            msg = int.from_bytes(raw[pos + 4:pos + 6], 'little')
+            end = pos + 24 + length
+            if msg != 12 or end + 4 > len(raw) or length < 4:
+                continue
+            stored = int.from_bytes(raw[end:end + 4], 'little')
+            if crc32b(raw[pos:end]) != stored:
+                binary_bad += 1
+                continue
+            week = int.from_bytes(raw[pos + 10:pos + 12], 'little')
+            ms = int.from_bytes(raw[pos + 12:pos + 16], 'little')
+            times.append(week * 604800.0 + ms / 1000.0)
+            locked.append(self._obsvm_locked(raw[pos + 24:end]))
+        if len(times) < 3:
+            raise SystemExit('未找到 CRC 校验通过的 OBSVMB 二进制观测帧')
+        cycles = cut_cycles(times, locked)
+        pos_integrity = frame_integrity([r['t'] for r in pos_rows])
+        lock_integrity = frame_integrity(times)
+        return dict(product=self.key, display=self.display, file=os.path.basename(path),
+                    lock_times=times, lock_counts=locked, lock_src='OBSVMB',
+                    lock_rate=round(1.0 / lock_integrity['period'], 1), cycles=cycles,
+                    pos_rows=pos_rows, pos_src='BESTNAVA',
+                    counts=dict(counts), other=dict(other), crc_bad=bad + binary_bad,
+                    pos_integrity=pos_integrity, lock_integrity=lock_integrity,
+                    span=round(pos_rows[-1]['t'] - pos_rows[0]['t'], 1) if pos_rows else 0,
+                    parser=self)
+
+    def lock_clause(self):
+        return 'N4 R1.15 7.3.65 OBSVM 表7-137 字段10(C/N0)/字段12(locktime)'
+    def pt_clause(self):
+        return 'N4 R1.15 表0-5（SINGLE=16/PSRDIFF=17/NARROW_FLOAT=34/NARROW_INT=50）'
+    def sv_clause(self):
+        return 'N4 R1.15 7.3.19 BESTNAV 表7-70 字段15(#SVs)/16(#solnSVs)'
+    def stn_clause(self):
+        return 'N4 R1.15 7.3.19 BESTNAV 表7-70 字段12(stn id)'
+    def main_msg(self):
+        return 'BESTNAVA（定位状态）+ OBSVMB（locktime）'
+
+
 
 def frame_integrity(times):
     """由报头时间序列计算完整性指标：

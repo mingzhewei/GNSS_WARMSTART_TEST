@@ -61,6 +61,18 @@ def analyze_cycle(parser, t0, rows, cycle_end=None, after=WINDOW_AFTER):
              stn=first(lambda r: r['stn'] not in ('', '0')),
              svs10=first(lambda r: r['svs'] >= 10),
              svs20=first(lambda r: r['svs'] >= 20))
+    # ?????????????????????/???????????/?????
+    # ??????? regression_*?????????????????????
+    first_fixed = f['fixed']
+    first_single = f['single']
+    first_float = f['float']
+    if first_fixed is not None:
+        if first_float is not None and first_float >= first_fixed:
+            f['regression_float'] = first_float
+            f['float'] = None
+        if first_single is not None and first_single >= first_fixed:
+            f['regression_single'] = first_single
+            f['single'] = None
     fixed_hold = None
     for i, r in enumerate(valid):
         if cat_of(parser, r['pt']) == 3:
@@ -177,6 +189,27 @@ def setup_mpl():
     return plt
 
 
+def dynamic_ylim(values, frac=0.75):
+    """???????? Y ????
+
+    ? IQR ??????? = Q3 + 2*IQR??? 15% ?????????
+    ?? = max*1.15??? (??, ?????)????????????????
+    """
+    import math
+    import statistics
+    vals = sorted(v for v in values if v is not None and not (isinstance(v, float) and math.isnan(v)))
+    if not vals:
+        return None, []
+    n = len(vals)
+    q1 = vals[n // 4]
+    q3 = vals[min(n - 1, (3 * n) // 4)]
+    iqr = max(q3 - q1, 0.0)
+    upper = q3 + 2.0 * iqr if iqr > 0 else vals[-1]
+    outliers = [v for v in vals if v > upper]
+    ylim = max(1.0, upper * 1.15)
+    return ylim, outliers
+
+
 def make_images(data, out_dir):
     plt = setup_mpl()
     paths = {}
@@ -223,6 +256,25 @@ def make_images(data, out_dir):
                 ys.append(v if v is not None else float('nan'))
             ax.scatter(xs, ys, marker=mk, s=60, label=lab, zorder=3,
                        color={'single': '#3b82f6', 'float': '#f59e0b', 'fixed': '#16a34a'}[key])
+        # ?????????? IQR ?????????????????????
+        all_vals = []
+        for key, _, _ in marks:
+            for c in cyc:
+                v = next((dv['first'][key] for dv in c['devs'] if dv['product'] == prod), None)
+                if v is not None:
+                    all_vals.append(v)
+        ylim, outliers = dynamic_ylim(all_vals)
+        if ylim is not None:
+            ax.set_ylim(0, ylim)
+        if outliers:
+            for key, _, _ in marks:
+                for ci, c in enumerate(cyc):
+                    v = next((dv['first'][key] for dv in c['devs'] if dv['product'] == prod), None)
+                    if v is not None and v > ylim:
+                        ax.annotate('%.1fs?' % v, (xs[ci], ylim), textcoords='offset points',
+                                    xytext=(0, 6), ha='center', fontsize=8, color='#dc2626')
+            ax.set_title(ax.get_title() + '??? %.1fs?%d ??????????'
+                         % (ylim, len(outliers)), fontsize=11)
         ax.set_xticks(xs); ax.set_xticklabels(labs, fontsize=8)
         ax.set_ylabel('耗时(s)'); ax.set_title('%s 关键时刻（定位源：%s）' % (
             prod, next((dv['pos_src'] for c in cyc for dv in c['devs']

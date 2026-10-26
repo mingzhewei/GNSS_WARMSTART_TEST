@@ -11,3 +11,5 @@ __pycache__/
 # 临时文件
 *.tmp
 ~$*
+# temporary verification reports
+reports_tmp_*/

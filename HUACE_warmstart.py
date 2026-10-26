@@ -299,6 +299,16 @@ def analyze_cycle(cyc, t0, rows, after=180.0):
              stn=first(lambda r: r['stn'] not in ('', '0')),
              svs10=first(lambda r: r['svs'] >= 10),
              svs20=first(lambda r: r['svs'] >= 20))
+    # ?????????????????????/???????????/?????
+    # ??????? regression_*?????????????????????
+    first_fixed = f['fixed']
+    if first_fixed is not None:
+        if f['float'] is not None and f['float'] >= first_fixed:
+            f['regression_float'] = f['float']
+            f['float'] = None
+        if f['single'] is not None and f['single'] >= first_fixed:
+            f['regression_single'] = f['single']
+            f['single'] = None
     fixed_hold = None
     for i, r in enumerate(valid):
         if cat_of(r['pt']) == 3:
@@ -386,6 +396,27 @@ def setup_mpl():
     return plt
 
 
+def dynamic_ylim(values, frac=0.75):
+    """???????? Y ????
+
+    ? IQR ??????? = Q3 + 2*IQR??? 15% ?????????
+    ?? = max*1.15??? (??, ?????)????????????????
+    """
+    import math
+    import statistics
+    vals = sorted(v for v in values if v is not None and not (isinstance(v, float) and math.isnan(v)))
+    if not vals:
+        return None, []
+    n = len(vals)
+    q1 = vals[n // 4]
+    q3 = vals[min(n - 1, (3 * n) // 4)]
+    iqr = max(q3 - q1, 0.0)
+    upper = q3 + 2.0 * iqr if iqr > 0 else vals[-1]
+    outliers = [v for v in vals if v > upper]
+    ylim = max(1.0, upper * 1.15)
+    return ylim, outliers
+
+
 def make_images(data, out_dir):
     plt = setup_mpl()
     paths = {}
@@ -405,6 +436,21 @@ def make_images(data, out_dir):
             if y == y:
                 ax.annotate('%.1f' % y, (x, y), textcoords='offset points', xytext=(4, 5),
                             fontsize=7.5, color=col)
+    # ?????? IQR ???????????????????????
+    all_vals = [c['first'][key] for c in cyc for key, _, _, _ in marks
+                if c['first'][key] is not None]
+    ylim, outliers = dynamic_ylim(all_vals)
+    if ylim is not None:
+        ax.set_ylim(0, ylim)
+    if outliers:
+        for ci, c in enumerate(cyc):
+            for key, _, col, _ in marks:
+                v = c['first'][key]
+                if v is not None and v > ylim:
+                    ax.annotate('%.1fs?' % v, (xs[ci], ylim), textcoords='offset points',
+                                xytext=(0, 6), ha='center', fontsize=8, color='#dc2626')
+        ax.set_title(ax.get_title() + '??? %.1fs?%d ??????????'
+                     % (ylim, len(outliers)), fontsize=13)
     ax.set_xticks(xs); ax.set_xticklabels(labs, fontsize=9)
     ax.set_xlabel('热启动周期（断天线重接次序）'); ax.set_ylabel('自起点(locktime)耗时（秒）')
     ax.set_title('%s 各热启动周期关键时刻（t=0 为双机更早的 locktime 起点）' % PRODUCT, fontsize=13)
